@@ -1,3 +1,9 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Book project files (source documents and results are not tracked)
+books/*/source/*
+!books/*/source/.gitkeep
+books/*/result/*
+!books/*/result/.gitkeep
