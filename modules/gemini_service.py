@@ -26,7 +26,7 @@ class Translator:
             types.SafetySetting(category="HARM_CATEGORY_HARASSMENT",         threshold="OFF"),
         ]
 
-        self.text_model = "gemini-3.1-flash-lite"
+        self.text_model = "gemini-3.1-flash-lite-preview"
         self.text_model_config = types.GenerateContentConfig(
             temperature=1,
             top_p=0.95,
