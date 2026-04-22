@@ -28,10 +28,7 @@ except ImportError as e:
 
 # Constants
 BASE_DIR = Path(__file__).resolve().parent
-GLOSSARY_PATH = BASE_DIR / "glossary.csv"
-HONORIFICS_PATH = BASE_DIR / "honorifics.csv"
-TARGET_DIR = BASE_DIR / "target"
-OUTPUT_DIR = BASE_DIR / "output"
+BOOKS_DIR = BASE_DIR / "books"
 TEXT_LENGTH_LIMIT = 2048
 
 # Initialize Console
@@ -98,28 +95,6 @@ def wait_for_exit(message: str | None = None) -> None:
     console.input(password=True)
 
 
-def ensure_output_dir() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def ensure_target_dir() -> None:
-    TARGET_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def get_first_target_file() -> Path | None:
-    ensure_target_dir()
-
-    target_files = sorted(TARGET_DIR.iterdir())
-    if not target_files:
-        print_center(f"[bold red]오류:[/bold red] '{TARGET_DIR}' 폴더에 파일이 없습니다.")
-        return None
-
-    return target_files[0]
-
-
-def has_target_files() -> bool:
-    return TARGET_DIR.exists() and any(TARGET_DIR.iterdir())
-
 def ensure_api_key() -> bool:
     api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
     if api_key:
@@ -144,6 +119,73 @@ def ensure_api_key() -> bool:
     print_center("[green]✓ API key 설정 완료[/green]")
     return True
 
+
+def get_projects() -> list[Path]:
+    if not BOOKS_DIR.exists():
+        return []
+    return sorted([d for d in BOOKS_DIR.iterdir() if d.is_dir()])
+
+
+def select_project() -> Path | None:
+    projects = get_projects()
+    if not projects:
+        print_center(f"[bold red]오류:[/bold red] '{BOOKS_DIR}' 폴더에 프로젝트가 없습니다.")
+        return None
+
+    selected = questionary.select(
+        "번역할 작품을 선택하세요:",
+        choices=[p.name for p in projects],
+        style=QUESTIONARY_STYLE
+    ).ask()
+
+    if not selected:
+        return None
+
+    return BOOKS_DIR / selected
+
+
+def select_source_file(project_dir: Path) -> Path | None:
+    source_dir = project_dir / "source"
+    if not source_dir.exists():
+        print_center(f"[bold red]오류:[/bold red] '{source_dir}' 폴더가 없습니다.")
+        return None
+
+    files = sorted([f for f in source_dir.iterdir() if f.is_file() and f.name != ".gitkeep"])
+    if not files:
+        print_center(f"[bold red]오류:[/bold red] '{source_dir}' 폴더에 파일이 없습니다.")
+        return None
+
+    selected = questionary.select(
+        "번역할 파일을 선택하세요:",
+        choices=[f.name for f in files],
+        style=QUESTIONARY_STYLE
+    ).ask()
+
+    if not selected:
+        return None
+
+    return source_dir / selected
+
+
+def get_output_path(project_dir: Path, source_file: Path) -> Path:
+    result_dir = project_dir / "result"
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = source_file.stem
+    suffix = source_file.suffix
+
+    output_path = result_dir / f"[translated] {stem}{suffix}"
+    if not output_path.exists():
+        return output_path
+
+    idx = 1
+    while True:
+        output_path = result_dir / f"[translated] {stem} ({idx}){suffix}"
+        if not output_path.exists():
+            return output_path
+        idx += 1
+
+
 def calculate_total_paragraphs(docx: Docx) -> int:
     ad_range = 1
     if docx.doc:
@@ -155,36 +197,30 @@ def calculate_total_paragraphs(docx: Docx) -> int:
     return len(docx.doc) - ad_range
 
 
-def translate(thinking_level: str) -> None:
-    target_file = get_first_target_file()
-    if not target_file:
-        return
-
-    ensure_output_dir()
-
+def translate(project_dir: Path, source_file: Path, thinking_level: str) -> None:
     with console.status("[bold green]번역기 초기화 중...", spinner="dots"):
         translator = Translator(text_length=TEXT_LENGTH_LIMIT, thinking_level=thinking_level)
         print_center("[green]✓ 번역기 초기화 완료[/green]")
 
     with console.status("[bold green]용어집 불러오는 중...", spinner="dots"):
-        glossary = load_glossary(str(GLOSSARY_PATH))
+        glossary = load_glossary(str(project_dir / "glossary.csv"))
         translator.set_glossary(glossary)
         print_center(f"[green]✓ 용어집 로드 완료 ({len(glossary)}개 용어)[/green]")
 
     with console.status("[bold green]호칭 룰북 불러오는 중...", spinner="dots"):
-        honorifics = load_honorifics(str(HONORIFICS_PATH))
+        honorifics = load_honorifics(str(project_dir / "honorifics.csv"))
         translator.set_honorifics(honorifics)
         print_center(f"[green]✓ 호칭 룰북 로드 완료 ({len(honorifics)}개 규칙)[/green]")
 
-    with console.status(f"[bold green]문서 불러오는 중: {target_file.name}...", spinner="dots"):
+    with console.status(f"[bold green]문서 불러오는 중: {source_file.name}...", spinner="dots"):
         docx = Docx()
-        docx.load_from_path(str(target_file), max_len=TEXT_LENGTH_LIMIT)
+        docx.load_from_path(str(source_file), max_len=TEXT_LENGTH_LIMIT)
         print_center(f"[green]✓ 문서 로드 완료 ({len(docx.doc)} 청크)[/green]")
 
     total_paragraphs = calculate_total_paragraphs(docx)
 
     print_center(Panel(
-        f"[bold]번역 시작[/bold]\n파일: {target_file.name}\n총 청크 수: {total_paragraphs}",
+        f"[bold]번역 시작[/bold]\n파일: {source_file.name}\n총 청크 수: {total_paragraphs}",
         border_style="blue",
         expand=False
     ))
@@ -232,9 +268,7 @@ def translate(thinking_level: str) -> None:
             paragraph.text = translator.translate_text(paragraph.text)
             advance_task(task_id, time.perf_counter() - start_time)
 
-    # Save Document
-    output_filename = f"[translated] {target_file.name}"
-    output_path = OUTPUT_DIR / output_filename
+    output_path = get_output_path(project_dir, source_file)
 
     with console.status("[bold green]문서 저장 중...", spinner="dots"):
         docx.save_to_path(str(output_path))
@@ -248,28 +282,25 @@ def translate(thinking_level: str) -> None:
 
 
 def main() -> None:
-    """Entry point for the CLI UI."""
     console.clear()
-    print_center(Panel("[bold cyan]Docx 번역기 v0.1[/bold cyan]", expand=False, border_style="cyan"))
-
-    ensure_target_dir()
+    print_center(Panel("[bold cyan]Docx 번역기 v0.2[/bold cyan]", expand=False, border_style="cyan"))
 
     if not ensure_api_key():
-        print_center("종료하려면 Enter 키를 누르세요...")
-        console.input(password=True)
-        return
-
-    # Initial check
-    if not has_target_files():
-        print_center(
-            f"[bold red]오류:[/bold red] '{TARGET_DIR}' 폴더에 번역할 파일이 없습니다.\n"
-            "파일을 추가한 후 다시 시도해주세요."
-        )
         wait_for_exit()
         return
 
-    # User Selection
-    print_center("[bold]설정 확인[/bold]")
+    project_dir = select_project()
+    if not project_dir:
+        return
+
+    print_center(f"[green]✓ 작품 선택: [bold]{project_dir.name}[/bold][/green]")
+
+    source_file = select_source_file(project_dir)
+    if not source_file:
+        return
+
+    print_center(f"[green]✓ 파일 선택: [bold]{source_file.name}[/bold][/green]")
+    console.print()
 
     thinking_level_sel = questionary.select(
         "모델의 추론 수준을 선택하세요.\n추론 수준이 높을수록 더 정교한 번역이 가능하지만, 처리 시간이 길어질 수 있습니다.\n최소 수준 추론도 충분히 정교한 번역을 제공합니다:",
@@ -279,14 +310,14 @@ def main() -> None:
     ).ask()
 
     if not thinking_level_sel:
-        return  # User cancelled
-    
+        return
+
     thinking_level = {"최소": "MINIMAL", "낮음": "LOW", "보통": "MEDIUM", "높음": "HIGH"}[thinking_level_sel]
 
-    print_center(f"[dim]선택된 옵션: 추론 수준 {thinking_level_sel} / 이미지 원본 유지[/dim]")
+    print_center(f"[dim]선택: {project_dir.name} / {source_file.name} / 추론 수준 {thinking_level_sel}[/dim]")
     console.print()
 
-    translate(thinking_level)
+    translate(project_dir, source_file, thinking_level)
 
 if __name__ == "__main__":
     try:
