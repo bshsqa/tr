@@ -1,6 +1,5 @@
 import os
 import re
-import io
 import json
 import time
 from google import genai
@@ -85,12 +84,22 @@ class Translator:
                 time.sleep(5)
 
     def _gen_content_dict(self, contents: list, model: str, config: types.GenerateContentConfig) -> dict:
-        while True:
+        for _ in range(5):
             try:
                 res = self._gen_content(model=model, config=config, contents=contents)
+                if res.text is None:
+                    time.sleep(5)
+                    continue
                 return json.loads(res.text)
             except json.JSONDecodeError:
                 pass
+        return {}
+
+    def get_memory(self) -> list:
+        return self.memory.copy()
+
+    def set_memory(self, memory: list) -> None:
+        self.memory = memory
 
     def _add_memory(self, text: str):
         self.memory.append(text)
@@ -149,6 +158,9 @@ class Translator:
             )
             translation = res.get("translation", "")
 
+            if not translation:
+                continue
+
             jp_contexts = self._find_japanese_contexts(translation)
             if not jp_contexts:
                 self._add_memory(translation)
@@ -166,8 +178,11 @@ class Translator:
                 f"{context_list}"
             )
 
-        self._add_memory(best_result)
-        return best_result
+        if best_result:
+            self._add_memory(best_result)
+            return best_result
+
+        return text
 
     def translate_image(self, image: Image.Image, tgt_lang: str = "Korean") -> Image.Image:
         raise NotImplementedError("Image translation is not supported with the free API.")

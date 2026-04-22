@@ -16,6 +16,7 @@ try:
     )
     from rich.text import Text
     import time
+    import json
 
     from modules.document import Docx
     from modules.gemini_service import Translator
@@ -30,6 +31,7 @@ except ImportError as e:
 BASE_DIR = Path(__file__).resolve().parent
 BOOKS_DIR = BASE_DIR / "books"
 TEXT_LENGTH_LIMIT = 2048
+CHECKPOINT_INTERVAL = 10
 
 # Initialize Console
 console = Console()
@@ -167,6 +169,36 @@ def select_source_file(project_dir: Path) -> Path | None:
     return source_dir / selected
 
 
+def get_checkpoint_path(project_dir: Path, source_file: Path) -> Path:
+    result_dir = project_dir / "result"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    return result_dir / f"[checkpoint] {source_file.stem}.json"
+
+
+def load_checkpoint(path: Path, source_name: str, total: int) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("source_file") == source_name and data.get("total") == total:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def save_checkpoint(path: Path, source_name: str, total: int, completed: int, texts: list, memory: list) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({
+            "source_file": source_name,
+            "total": total,
+            "completed": completed,
+            "texts": texts,
+            "memory": memory,
+        }, f, ensure_ascii=False, indent=2)
+
+
 def get_output_path(project_dir: Path, source_file: Path) -> Path:
     result_dir = project_dir / "result"
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -219,11 +251,40 @@ def translate(project_dir: Path, source_file: Path, thinking_level: str) -> None
 
     total_paragraphs = calculate_total_paragraphs(docx)
 
-    print_center(Panel(
-        f"[bold]번역 시작[/bold]\n파일: {source_file.name}\n총 청크 수: {total_paragraphs}",
-        border_style="blue",
-        expand=False
-    ))
+    # Checkpoint
+    checkpoint_path = get_checkpoint_path(project_dir, source_file)
+    checkpoint = load_checkpoint(checkpoint_path, source_file.name, total_paragraphs)
+
+    resume_from = 0
+    saved_texts = [None] * len(docx.doc)
+
+    if checkpoint:
+        completed = checkpoint.get("completed", 0)
+        resume = questionary.confirm(
+            f"이전 번역 진행 상황이 있습니다 ({completed}/{total_paragraphs}). 이어서 번역하시겠습니까?",
+            default=True,
+            style=QUESTIONARY_STYLE
+        ).ask()
+
+        if resume is None:
+            return
+
+        if resume:
+            resume_from = completed
+            saved_texts = checkpoint.get("texts", saved_texts)
+            translator.set_memory(checkpoint.get("memory", []))
+            for i, text in enumerate(saved_texts):
+                if text is not None and i < len(docx.doc):
+                    docx.doc[i].text = text
+            print_center(f"[green]✓ {completed}/{total_paragraphs} 청크부터 이어서 번역합니다.[/green]")
+        else:
+            checkpoint_path.unlink(missing_ok=True)
+
+    panel_title = "번역 재개" if resume_from > 0 else "번역 시작"
+    panel_body = f"[bold]{panel_title}[/bold]\n파일: {source_file.name}\n총 청크 수: {total_paragraphs}"
+    if resume_from > 0:
+        panel_body += f"\n재개 위치: {resume_from} / {total_paragraphs}"
+    print_center(Panel(panel_body, border_style="blue", expand=False))
 
     def advance_task(task_id: int, elapsed_seconds: float | None = None) -> None:
         task = progress.tasks[task_id]
@@ -246,9 +307,9 @@ def translate(project_dir: Path, source_file: Path, thinking_level: str) -> None
         transient=False,
     ) as progress:
 
-        task_id = progress.add_task("[cyan]번역 중...", total=total_paragraphs)
+        task_id = progress.add_task("[cyan]번역 중...", total=total_paragraphs, completed=resume_from)
 
-        for idx in range(total_paragraphs):
+        for idx in range(resume_from, total_paragraphs):
             paragraph = docx.doc[idx]
             tgt_object = "이미지" if paragraph.image else "텍스트"
             progress.update(
@@ -267,6 +328,12 @@ def translate(project_dir: Path, source_file: Path, thinking_level: str) -> None
             start_time = time.perf_counter()
             paragraph.text = translator.translate_text(paragraph.text)
             advance_task(task_id, time.perf_counter() - start_time)
+
+            saved_texts[idx] = paragraph.text
+            if (idx + 1) % CHECKPOINT_INTERVAL == 0:
+                save_checkpoint(checkpoint_path, source_file.name, total_paragraphs, idx + 1, saved_texts, translator.get_memory())
+
+    checkpoint_path.unlink(missing_ok=True)
 
     output_path = get_output_path(project_dir, source_file)
 
