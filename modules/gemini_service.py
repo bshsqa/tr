@@ -1,5 +1,5 @@
-# modules/gemini_service.py
 import os
+import re
 import io
 import json
 import time
@@ -9,92 +9,70 @@ from PIL import Image
 
 
 class Translator:
-    def __init__(self, text_length: int, thinking_level: str, vertexai: bool = True):
-        self.client = self._get_client(vertexai)
+    def __init__(self, text_length: int, thinking_level: str):
+        self.client = genai.Client(
+            api_key=os.environ.get("GOOGLE_API_KEY"),
+        )
 
         self.text_length = text_length
-
         self.glossary = ""
+        self.honorifics = []
         self.memory = []
 
-        self.safety_settings = [types.SafetySetting(
-            category="HARM_CATEGORY_HATE_SPEECH",
-            threshold="OFF"
-        ),types.SafetySetting(
-            category="HARM_CATEGORY_DANGEROUS_CONTENT",
-            threshold="OFF"
-        ),types.SafetySetting(
-            category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-            threshold="OFF"
-        ),types.SafetySetting(
-            category="HARM_CATEGORY_HARASSMENT",
-            threshold="OFF"
-        )]
+        self.safety_settings = [
+            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH",        threshold="OFF"),
+            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT",  threshold="OFF"),
+            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT",  threshold="OFF"),
+            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT",         threshold="OFF"),
+        ]
 
-        self.image_model = "gemini-3-pro-image-preview" # Nano Banana Pro
-        self.image_model_config = types.GenerateContentConfig(
-            temperature = 1,
-            top_p = 0.95,
-            max_output_tokens = 32768,
-            response_modalities = ["IMAGE"],
-            safety_settings = self.safety_settings,
-            image_config=types.ImageConfig(
-            #aspect_ratio="2:3",
-            #image_size="1K",
-            output_mime_type="image/png",
-            ),
-        )
-        self.text_in_image_config = types.GenerateContentConfig(
-            temperature = 1,
-            top_p = 0.95,
-            max_output_tokens = 65535,
-            safety_settings = self.safety_settings,
-            response_mime_type = "application/json",
-            response_schema = {"type":"OBJECT","properties":{"is_text_present":{"type":"BOOLEAN"}}},
-            thinking_config=types.ThinkingConfig(
-            thinking_level="MINIMAL", # MINIMAL, LOW, MEDIUM, HIGH
-            ),
-        )
-
-        self.text_model = "gemini-3-flash-preview"
+        self.text_model = "gemini-3.1-flash-lite"
         self.text_model_config = types.GenerateContentConfig(
-            temperature = 1,
-            top_p = 0.95,
-            max_output_tokens = 65535,
-            safety_settings = self.safety_settings,
-            response_mime_type = "application/json",
-            response_schema = {"type":"OBJECT","properties":{"translation":{"type":"STRING"}}},
+            temperature=1,
+            top_p=0.95,
+            max_output_tokens=65535,
+            safety_settings=self.safety_settings,
+            response_mime_type="application/json",
+            response_schema={"type": "OBJECT", "properties": {"translation": {"type": "STRING"}}},
             thinking_config=types.ThinkingConfig(
-            thinking_level=thinking_level, # MINIMAL, LOW, MEDIUM, HIGH
+                thinking_level=thinking_level,
             ),
         )
-    
-    def _get_client(self, vertexai: bool):
-        return genai.Client(
-            vertexai=vertexai,
-            api_key=os.environ.get("GOOGLE_CLOUD_API_KEY") if vertexai else os.environ.get("GOOGLE_API_KEY"),
-        )
-    
+
     def set_glossary(self, glossary: dict):
         if not glossary:
             self.glossary = ""
             return
-        
-        self.glossary = "Use the following glossary for translation:\n"
+
+        lines = ["Glossary (YOU MUST use these exact Korean translations — never deviate):"]
         for src_term, tgt_term in glossary.items():
-            self.glossary += f"- {src_term} : {tgt_term}\n"
-    
+            lines.append(f"- {src_term} : {tgt_term}")
+        self.glossary = "\n".join(lines)
+
+    def set_honorifics(self, honorifics: list):
+        self.honorifics = honorifics
+
+    def _get_honorifics_prompt(self) -> str:
+        if not self.honorifics:
+            return ""
+        lines = [
+            "Honorific rules — each honorific form is complete and already includes the suffix.",
+            "Do NOT append さん, 상, 씨, or any other suffix on top of the specified form:",
+        ]
+        for caller, target, honorific in self.honorifics:
+            lines.append(f'- When {caller} refers to {target}, always use "{honorific}"')
+        return "\n".join(lines)
+
     def _gen_content(self, contents: list, model: str, config: types.GenerateContentConfig) -> types.GenerateContentResponse:
         while True:
             try:
-                res = self.client.models.generate_content(
+                return self.client.models.generate_content(
                     model=model,
                     config=config,
-                    contents=contents
+                    contents=contents,
                 )
-                return res
             except Exception as e:
-                e_code = getattr(e, 'code', None)
+                e_code = getattr(e, "code", None)
                 if e_code == 429:
                     print("요청 한도를 초과했습니다. 5초 후 재시도합니다...")
                     time.sleep(5)
@@ -105,91 +83,91 @@ class Translator:
                     raise Exception("권한이 없습니다. API 키의 권한을 확인하고 다시 시도해주세요.")
                 print(f"Error Code: {e_code}, 5초 후 재시도합니다...")
                 time.sleep(5)
-        
+
     def _gen_content_dict(self, contents: list, model: str, config: types.GenerateContentConfig) -> dict:
         while True:
             try:
-                res = self._gen_content(
-                    model=model,
-                    config=config,
-                    contents=contents
-                )
+                res = self._gen_content(model=model, config=config, contents=contents)
                 return json.loads(res.text)
             except json.JSONDecodeError:
                 pass
 
-    
-    def translate_image(self, image: Image.Image, tgt_lang: str = "Korean") -> Image.Image:
-        contents = [
-            f"Is there any text present in this image? Respond with a JSON object with a boolean field 'is_text_present'.",
-            image
-        ]
-        res = self._gen_content_dict(
-            model=self.text_model,
-            config=self.text_in_image_config,
-            contents=contents
-        )
-        is_text_present = res.get("is_text_present", False)
-        if not is_text_present:
-            return image
-
-        contents = [
-            "You are a professional translator specialized in image translation.",
-            self.glossary,
-            self._get_memory(),
-            f"Translate the content of this image to {tgt_lang}. Provide only the translated image without any additional text or explanations:\n",
-            image,
-        ]
-
-        # new
-        res = self._gen_content(
-            model=self.image_model,
-            config=self.image_model_config,
-            contents=contents
-        )
-
-        img_data = res.parts[0].inline_data
-        img = Image.open(io.BytesIO(img_data.data))
-        return img
-    
     def _add_memory(self, text: str):
         self.memory.append(text)
         while len("\n".join(self.memory)) > self.text_length * 2:
             self.memory.pop(0)
-    
+
     def _get_memory(self) -> str:
-        memory_prompt = "\n".join(self.memory)
-        memory_prompt = f"Translation memory (use for consistency; do not translate this memory):\n{memory_prompt}\n" if memory_prompt else ""
-        return memory_prompt
+        if not self.memory:
+            return ""
+        joined = "\n".join(self.memory)
+        return f"Translation memory (use for consistency; do not translate this section):\n{joined}\n"
+
+    def _count_japanese(self, text: str) -> int:
+        return len(re.findall(r'[぀-ヿ一-鿿]', text))
+
+    def _find_japanese_contexts(self, text: str) -> list[str]:
+        contexts = []
+        for m in re.finditer(r'[぀-ヿ一-鿿]+', text):
+            start = max(0, m.start() - 15)
+            end = min(len(text), m.end() + 15)
+            contexts.append(text[start:end])
+        return contexts
+
+    def _build_translate_contents(self, text: str, tgt_lang: str, retry_hint: str) -> list:
+        contents = [
+            f"You are a professional Japanese-to-{tgt_lang} translator specializing in light novels.",
+            self.glossary,
+            self._get_honorifics_prompt(),
+            self._get_memory(),
+            "Follow ALL of these rules strictly:",
+            "1. Translate every Japanese character (hiragana, katakana, kanji) to Korean. The output must contain zero Japanese characters.",
+            "2. Use the EXACT Korean terms from the glossary for every listed term. Never substitute or omit glossary terms.",
+            "3. Translate Japanese interjections and fillers (えっと→음..., ええ→에..., あの→저..., うん→응, ねえ→있잖아, etc.) into natural Korean equivalents.",
+            "4. Translate all onomatopoeia and mimetic words (擬音語·擬態語) into appropriate Korean equivalents (e.g. パチパチ→짝짝, ドキドキ→두근두근, ボロボロ→너덜너덜).",
+            "5. Infer each character's unique speech style from context and maintain it consistently throughout.",
+            "6. Produce natural, fluent Korean that reads as if originally written in Korean — not a literal translation.",
+            "7. Preserve all line breaks exactly as in the source.",
+            "8. Keep symbols such as 「」 unchanged.",
+        ]
+        if retry_hint:
+            contents.append(retry_hint)
+        contents.append(f"Translate the following text to {tgt_lang}:\n{text}")
+        return contents
 
     def translate_text(self, text: str, tgt_lang: str = "Korean") -> str:
-        contents = [
-            "You are a professional translator.",
-            self.glossary,
-            self._get_memory(),
-            "Keep symbols such as 「」 unchanged.",
-            "Preserve line breaks in the output. You always include appropriate line breaks in the translation.",
-            f"Translate the following text to {tgt_lang}:\n",
-            text
-        ]
+        best_result = ""
+        best_jp_count = float("inf")
+        retry_hint = ""
 
-        res = self._gen_content_dict(
-            model=self.text_model,
-            config=self.text_model_config,
-            contents=contents
-        )
+        for attempt in range(3):
+            contents = self._build_translate_contents(text, tgt_lang, retry_hint)
+            res = self._gen_content_dict(
+                model=self.text_model,
+                config=self.text_model_config,
+                contents=contents,
+            )
+            translation = res.get("translation", "")
 
-        translation = res.get("translation", "")
-        self._add_memory(translation)
-        return translation
+            jp_contexts = self._find_japanese_contexts(translation)
+            if not jp_contexts:
+                self._add_memory(translation)
+                return translation
 
+            jp_count = self._count_japanese(translation)
+            if jp_count < best_jp_count:
+                best_jp_count = jp_count
+                best_result = translation
 
-if __name__ == "__main__":
-    translator = Translator()
-    img = Image.open("./test.png")
-    translated_img = translator.translate_image(img, tgt_lang="Korean")
-    translated_img.show()
-    translated_img.save("translated_test.png")
-    #text = "Hello, how are you?"
-    #translated_text = translator.translate_text(text, tgt_lang="Korean")
-    #print("\n" + translated_text)
+            context_list = "\n".join(f"  - '...{ctx}...'" for ctx in jp_contexts[:5])
+            retry_hint = (
+                f"WARNING: The previous translation still contained Japanese characters in the output. "
+                f"The following parts must be fully translated to Korean — do not leave any Japanese:\n"
+                f"{context_list}"
+            )
+
+        self._add_memory(best_result)
+        return best_result
+
+    def translate_image(self, image: Image.Image, tgt_lang: str = "Korean") -> Image.Image:
+        raise NotImplementedError("Image translation is not supported with the free API.")
