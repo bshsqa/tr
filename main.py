@@ -19,7 +19,7 @@ try:
 
     from modules.document import Docx
     from modules.gemini_service import Translator
-    from modules.util import load_glossary
+    from modules.util import load_glossary, load_honorifics
 except ImportError as e:
     missing_module = str(e).split("'")[1]
     print(f"오류: '{missing_module}' 모듈이 없습니다. 'pip install -r requirements.txt' 명령어로 필요한 모듈을 설치해주세요.")
@@ -29,6 +29,7 @@ except ImportError as e:
 # Constants
 BASE_DIR = Path(__file__).resolve().parent
 GLOSSARY_PATH = BASE_DIR / "glossary.csv"
+HONORIFICS_PATH = BASE_DIR / "honorifics.csv"
 TARGET_DIR = BASE_DIR / "target"
 OUTPUT_DIR = BASE_DIR / "output"
 TEXT_LENGTH_LIMIT = 2048
@@ -120,14 +121,13 @@ def has_target_files() -> bool:
     return TARGET_DIR.exists() and any(TARGET_DIR.iterdir())
 
 def ensure_api_key() -> bool:
-    """Ensure GOOGLE_CLOUD_API_KEY exists; prompt if missing."""
-    api_key = os.environ.get("GOOGLE_CLOUD_API_KEY", "").strip()
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
     if api_key:
         print_center("[green]✓ API key 확인됨[/green]")
         return True
 
     print_center(Panel(
-        "[bold]API Key 필요[/bold]\nGOOGLE_CLOUD_API_KEY를 입력해주세요.",
+        "[bold]API Key 필요[/bold]\nGOOGLE_API_KEY를 입력해주세요.",
         border_style="yellow",
         expand=False
     ))
@@ -140,14 +140,11 @@ def ensure_api_key() -> bool:
         print_center("[bold red]오류:[/bold red] API Key가 입력되지 않았습니다.")
         return False
 
-    os.environ["GOOGLE_CLOUD_API_KEY"] = api_key.strip()
+    os.environ["GOOGLE_API_KEY"] = api_key.strip()
     print_center("[green]✓ API key 설정 완료[/green]")
     return True
 
-def calculate_total_paragraphs(docx: Docx, include_ad_images: bool) -> int:
-    if include_ad_images:
-        return len(docx.doc)
-
+def calculate_total_paragraphs(docx: Docx) -> int:
     ad_range = 1
     if docx.doc:
         cur = docx.doc[-1]
@@ -158,8 +155,7 @@ def calculate_total_paragraphs(docx: Docx, include_ad_images: bool) -> int:
     return len(docx.doc) - ad_range
 
 
-def translate(translate_images: bool, translate_ad_images: bool, thinking_level: str) -> None:
-    """Translate the first DOCX file in the target directory."""
+def translate(thinking_level: str) -> None:
     target_file = get_first_target_file()
     if not target_file:
         return
@@ -175,13 +171,17 @@ def translate(translate_images: bool, translate_ad_images: bool, thinking_level:
         translator.set_glossary(glossary)
         print_center(f"[green]✓ 용어집 로드 완료 ({len(glossary)}개 용어)[/green]")
 
+    with console.status("[bold green]호칭 룰북 불러오는 중...", spinner="dots"):
+        honorifics = load_honorifics(str(HONORIFICS_PATH))
+        translator.set_honorifics(honorifics)
+        print_center(f"[green]✓ 호칭 룰북 로드 완료 ({len(honorifics)}개 규칙)[/green]")
+
     with console.status(f"[bold green]문서 불러오는 중: {target_file.name}...", spinner="dots"):
         docx = Docx()
         docx.load_from_path(str(target_file), max_len=TEXT_LENGTH_LIMIT)
         print_center(f"[green]✓ 문서 로드 완료 ({len(docx.doc)} 청크)[/green]")
 
-    include_ad_images = translate_images and translate_ad_images
-    total_paragraphs = calculate_total_paragraphs(docx, include_ad_images)
+    total_paragraphs = calculate_total_paragraphs(docx)
 
     print_center(Panel(
         f"[bold]번역 시작[/bold]\n파일: {target_file.name}\n총 청크 수: {total_paragraphs}",
@@ -199,7 +199,6 @@ def translate(translate_images: bool, translate_ad_images: bool, thinking_level:
             translated_chunks=task.fields.get("translated_chunks", 0) + 1
         )
 
-    # Processing Loop with Progress Bar
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -218,17 +217,11 @@ def translate(translate_images: bool, translate_ad_images: bool, thinking_level:
             tgt_object = "이미지" if paragraph.image else "텍스트"
             progress.update(
                 task_id,
-                description=f"[cyan]{tgt_object} 번역 중 {idx + 1}/{total_paragraphs}..."
+                description=f"[cyan]{tgt_object} 처리 중 {idx + 1}/{total_paragraphs}..."
             )
 
             if paragraph.image:
-                if not translate_images:
-                    advance_task(task_id)
-                    continue
-
-                start_time = time.perf_counter()
-                paragraph.image = translator.translate_image(paragraph.image)
-                advance_task(task_id, time.perf_counter() - start_time)
+                advance_task(task_id)
                 continue
 
             if len(paragraph.text.strip()) == 0:
@@ -290,45 +283,10 @@ def main() -> None:
     
     thinking_level = {"최소": "MINIMAL", "낮음": "LOW", "보통": "MEDIUM", "높음": "HIGH"}[thinking_level_sel]
 
-    action = questionary.select(
-        "이미지 번역 옵션을 선택하세요:",
-        choices=[
-            "✅ 네, 이미지 번역도 할게요 (느림)",
-            "❌ 아니요, 텍스트만 번역할게요 (빠름)"
-        ],
-        style=QUESTIONARY_STYLE
-    ).ask()
-
-    if not action:
-        return  # User cancelled
-
-    translate_images = "✅" in action
-    translate_ad_images = False
-
-    if translate_images:
-        ad_action = questionary.select(
-            "이미지 번역 시, 뒤에 나오는 광고 페이지 이미지도 번역할까요?",
-            choices=[
-                "❌ 아니요, 광고 이미지는 건너뛸게요 (추천)",
-                "✅ 네, 광고 이미지도 번역할게요"
-            ],
-            default="❌ 아니요, 광고 이미지는 건너뛸게요 (추천)",
-            style=QUESTIONARY_STYLE
-        ).ask()
-
-        if not ad_action:
-            return  # User cancelled
-
-        translate_ad_images = "✅" in ad_action
-    
-    option_text = "이미지 번역 켜기" if translate_images else "텍스트만 번역"
-    if translate_images:
-        option_text += " / 광고 이미지 포함" if translate_ad_images else " / 광고 이미지 제외"
-    print_center(f"[dim]선택된 옵션: {option_text} / 추론 수준: {thinking_level_sel}[/dim]")
+    print_center(f"[dim]선택된 옵션: 추론 수준 {thinking_level_sel} / 이미지 원본 유지[/dim]")
     console.print()
 
-    # Start Translation
-    translate(translate_images, translate_ad_images, thinking_level)
+    translate(thinking_level)
 
 if __name__ == "__main__":
     try:
