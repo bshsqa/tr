@@ -97,14 +97,35 @@ def wait_for_exit(message: str | None = None) -> None:
     console.input(password=True)
 
 
-def ensure_api_key() -> bool:
-    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+def select_backend() -> str | None:
+    selected = questionary.select(
+        "사용할 AI 백엔드를 선택하세요:",
+        choices=[
+            "Gemini 무료 API  (빠름, 이미지 번역 미지원)",
+            "Vertex AI        (이미지 번역 지원, 유료)",
+        ],
+        style=QUESTIONARY_STYLE,
+    ).ask()
+    if not selected:
+        return None
+    return "vertex" if "Vertex" in selected else "gemini"
+
+
+def ensure_api_key(backend: str) -> bool:
+    if backend == "vertex":
+        env_var = "GOOGLE_CLOUD_API_KEY"
+        label = "GOOGLE_CLOUD_API_KEY (Vertex AI)"
+    else:
+        env_var = "GOOGLE_API_KEY"
+        label = "GOOGLE_API_KEY (Gemini)"
+
+    api_key = os.environ.get(env_var, "").strip()
     if api_key:
         print_center("[green]✓ API key 확인됨[/green]")
         return True
 
     print_center(Panel(
-        "[bold]API Key 필요[/bold]\nGOOGLE_API_KEY를 입력해주세요.",
+        f"[bold]API Key 필요[/bold]\n{label}를 입력해주세요.",
         border_style="yellow",
         expand=False
     ))
@@ -117,7 +138,7 @@ def ensure_api_key() -> bool:
         print_center("[bold red]오류:[/bold red] API Key가 입력되지 않았습니다.")
         return False
 
-    os.environ["GOOGLE_API_KEY"] = api_key.strip()
+    os.environ[env_var] = api_key.strip()
     print_center("[green]✓ API key 설정 완료[/green]")
     return True
 
@@ -218,7 +239,10 @@ def get_output_path(project_dir: Path, source_file: Path) -> Path:
         idx += 1
 
 
-def calculate_total_paragraphs(docx: Docx) -> int:
+def calculate_total_paragraphs(docx: Docx, include_ad_images: bool = False) -> int:
+    if include_ad_images:
+        return len(docx.doc)
+
     ad_range = 1
     if docx.doc:
         cur = docx.doc[-1]
@@ -229,9 +253,9 @@ def calculate_total_paragraphs(docx: Docx) -> int:
     return len(docx.doc) - ad_range
 
 
-def translate(project_dir: Path, source_file: Path, thinking_level: str) -> None:
+def translate(project_dir: Path, source_file: Path, thinking_level: str, vertexai: bool = False, translate_images: bool = False, translate_ad_images: bool = False) -> None:
     with console.status("[bold green]번역기 초기화 중...", spinner="dots"):
-        translator = Translator(text_length=TEXT_LENGTH_LIMIT, thinking_level=thinking_level)
+        translator = Translator(text_length=TEXT_LENGTH_LIMIT, thinking_level=thinking_level, vertexai=vertexai)
         print_center("[green]✓ 번역기 초기화 완료[/green]")
 
     with console.status("[bold green]용어집 불러오는 중...", spinner="dots"):
@@ -249,7 +273,7 @@ def translate(project_dir: Path, source_file: Path, thinking_level: str) -> None
         docx.load_from_path(str(source_file), max_len=TEXT_LENGTH_LIMIT)
         print_center(f"[green]✓ 문서 로드 완료 ({len(docx.doc)} 청크)[/green]")
 
-    total_paragraphs = calculate_total_paragraphs(docx)
+    total_paragraphs = calculate_total_paragraphs(docx, include_ad_images=translate_images and translate_ad_images)
 
     # Checkpoint
     checkpoint_path = get_checkpoint_path(project_dir, source_file)
@@ -318,7 +342,12 @@ def translate(project_dir: Path, source_file: Path, thinking_level: str) -> None
             )
 
             if paragraph.image:
-                advance_task(task_id)
+                if not translate_images:
+                    advance_task(task_id)
+                    continue
+                start_time = time.perf_counter()
+                paragraph.image = translator.translate_image(paragraph.image)
+                advance_task(task_id, time.perf_counter() - start_time)
                 continue
 
             if len(paragraph.text.strip()) == 0:
@@ -352,7 +381,14 @@ def main() -> None:
     console.clear()
     print_center(Panel("[bold cyan]Docx 번역기 v0.2[/bold cyan]", expand=False, border_style="cyan"))
 
-    if not ensure_api_key():
+    backend = select_backend()
+    if not backend:
+        return
+
+    vertexai = backend == "vertex"
+    print_center(f"[green]✓ 백엔드: [bold]{'Vertex AI' if vertexai else 'Gemini 무료 API'}[/bold][/green]")
+
+    if not ensure_api_key(backend):
         wait_for_exit()
         return
 
@@ -381,10 +417,43 @@ def main() -> None:
 
     thinking_level = {"최소": "MINIMAL", "낮음": "LOW", "보통": "MEDIUM", "높음": "HIGH"}[thinking_level_sel]
 
-    print_center(f"[dim]선택: {project_dir.name} / {source_file.name} / 추론 수준 {thinking_level_sel}[/dim]")
+    translate_images = False
+    translate_ad_images = False
+
+    if vertexai:
+        img_action = questionary.select(
+            "이미지 번역 옵션을 선택하세요:",
+            choices=[
+                "❌ 아니요, 텍스트만 번역할게요 (빠름)",
+                "✅ 네, 이미지 번역도 할게요 (느림)",
+            ],
+            style=QUESTIONARY_STYLE,
+        ).ask()
+        if not img_action:
+            return
+        translate_images = "✅" in img_action
+
+        if translate_images:
+            ad_action = questionary.select(
+                "광고 페이지 이미지도 번역할까요?",
+                choices=[
+                    "❌ 아니요, 광고 이미지는 건너뛸게요 (추천)",
+                    "✅ 네, 광고 이미지도 번역할게요",
+                ],
+                default="❌ 아니요, 광고 이미지는 건너뛸게요 (추천)",
+                style=QUESTIONARY_STYLE,
+            ).ask()
+            if not ad_action:
+                return
+            translate_ad_images = "✅" in ad_action
+
+    summary = f"{project_dir.name} / {source_file.name} / 추론 수준 {thinking_level_sel}"
+    if vertexai:
+        summary += " / 이미지 번역 " + ("켜기" if translate_images else "끄기")
+    print_center(f"[dim]선택: {summary}[/dim]")
     console.print()
 
-    translate(project_dir, source_file, thinking_level)
+    translate(project_dir, source_file, thinking_level, vertexai=vertexai, translate_images=translate_images, translate_ad_images=translate_ad_images)
 
 if __name__ == "__main__":
     try:

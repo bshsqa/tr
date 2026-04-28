@@ -1,4 +1,5 @@
 import os
+import io
 import re
 import json
 import time
@@ -8,10 +9,18 @@ from PIL import Image
 
 
 class Translator:
-    def __init__(self, text_length: int, thinking_level: str):
-        self.client = genai.Client(
-            api_key=os.environ.get("GOOGLE_API_KEY"),
-        )
+    def __init__(self, text_length: int, thinking_level: str, vertexai: bool = False):
+        self.vertexai = vertexai
+
+        if vertexai:
+            self.client = genai.Client(
+                vertexai=True,
+                api_key=os.environ.get("GOOGLE_CLOUD_API_KEY"),
+            )
+        else:
+            self.client = genai.Client(
+                api_key=os.environ.get("GOOGLE_API_KEY"),
+            )
 
         self.text_length = text_length
         self.glossary = ""
@@ -25,7 +34,27 @@ class Translator:
             types.SafetySetting(category="HARM_CATEGORY_HARASSMENT",         threshold="OFF"),
         ]
 
-        self.text_model = "gemini-3.1-flash-lite-preview"
+        if vertexai:
+            self.text_model = "gemini-3-flash-preview"
+            self.image_model = "gemini-3-pro-image-preview"
+            self.image_model_config = types.GenerateContentConfig(
+                temperature=1,
+                top_p=0.95,
+                max_output_tokens=32768,
+                response_modalities=["IMAGE"],
+                safety_settings=self.safety_settings,
+                image_config=types.ImageConfig(output_mime_type="image/png"),
+            )
+            self.text_in_image_config = types.GenerateContentConfig(
+                max_output_tokens=65535,
+                safety_settings=self.safety_settings,
+                response_mime_type="application/json",
+                response_schema={"type": "OBJECT", "properties": {"is_text_present": {"type": "BOOLEAN"}}},
+                thinking_config=types.ThinkingConfig(thinking_level="MINIMAL"),
+            )
+        else:
+            self.text_model = "gemini-3.1-flash-lite-preview"
+
         self.text_model_config = types.GenerateContentConfig(
             temperature=1,
             top_p=0.95,
@@ -185,4 +214,24 @@ class Translator:
         return text
 
     def translate_image(self, image: Image.Image, tgt_lang: str = "Korean") -> Image.Image:
-        raise NotImplementedError("Image translation is not supported with the free API.")
+        if not self.vertexai:
+            raise NotImplementedError("Image translation is not supported with the free API.")
+
+        res = self._gen_content_dict(
+            model=self.text_model,
+            config=self.text_in_image_config,
+            contents=["Is there any text present in this image? Respond with a JSON object with a boolean field 'is_text_present'.", image],
+        )
+        if not res.get("is_text_present", False):
+            return image
+
+        contents = [
+            "You are a professional translator specialized in image translation.",
+            self.glossary,
+            self._get_memory(),
+            f"Translate the content of this image to {tgt_lang}. Provide only the translated image without any additional text or explanations.",
+            image,
+        ]
+        res = self._gen_content(model=self.image_model, config=self.image_model_config, contents=contents)
+        img_data = res.parts[0].inline_data
+        return Image.open(io.BytesIO(img_data.data))
