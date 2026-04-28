@@ -213,25 +213,48 @@ class Translator:
 
         return text
 
+    def _is_valid_image_response(self, res) -> bool:
+        if not res or not res.parts:
+            return False
+        part = res.parts[0]
+        return hasattr(part, "inline_data") and part.inline_data is not None and part.inline_data.data is not None
+
     def translate_image(self, image: Image.Image, tgt_lang: str = "Korean") -> Image.Image:
         if not self.vertexai:
             raise NotImplementedError("Image translation is not supported with the free API.")
 
-        res = self._gen_content_dict(
+        detection = self._gen_content_dict(
             model=self.text_model,
             config=self.text_in_image_config,
             contents=["Is there any text present in this image? Respond with a JSON object with a boolean field 'is_text_present'.", image],
         )
-        if not res.get("is_text_present", False):
+        if not detection:
+            print("이미지 텍스트 감지 실패, 원본 반환")
+            return image
+        if not detection.get("is_text_present", False):
             return image
 
         contents = [
-            "You are a professional translator specialized in image translation.",
+            f"You are a professional Japanese-to-{tgt_lang} translator specializing in light novel illustrations.",
             self.glossary,
             self._get_memory(),
-            f"Translate the content of this image to {tgt_lang}. Provide only the translated image without any additional text or explanations.",
+            "Follow ALL of these rules strictly:",
+            "1. Translate ALL text elements in the image: speech bubbles, narration boxes, sound effects, captions, and any other text.",
+            "2. Preserve the original layout exactly — keep translated text in the same position, orientation, and approximate size as the source.",
+            "3. Translate onomatopoeia and sound effects (擬音語·擬態語) into natural Korean equivalents (e.g. ドキドキ→두근두근, ザワザワ→웅성웅성).",
+            "4. For vertical Japanese text, render the Korean translation in an appropriate direction that fits the layout.",
+            "5. Use the EXACT Korean terms from the glossary for every listed term.",
+            "6. Produce natural, fluent Korean — not a literal translation.",
+            f"Translate all text in this image to {tgt_lang} and return only the translated image.",
             image,
         ]
-        res = self._gen_content(model=self.image_model, config=self.image_model_config, contents=contents)
-        img_data = res.parts[0].inline_data
-        return Image.open(io.BytesIO(img_data.data))
+
+        for attempt in range(3):
+            res = self._gen_content(model=self.image_model, config=self.image_model_config, contents=contents)
+            if self._is_valid_image_response(res):
+                return Image.open(io.BytesIO(res.parts[0].inline_data.data))
+            print(f"이미지 번역 응답 불량 (시도 {attempt + 1}/3), 재시도...")
+            time.sleep(3)
+
+        print("이미지 번역 3회 모두 실패, 원본 반환")
+        return image
